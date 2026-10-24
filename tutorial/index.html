@@ -1,0 +1,1050 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanochat 内功拆解 · 交互教程</title>
+<meta name="description" content="从 tokenizer、embedding、Q/K/V、softmax 到预训练、SFT、RL 和 KV-cache 推理，沿着 nanochat 的真实代码走一遍。">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+
+<button class="menu-btn" id="menuBtn" aria-label="打开章节目录">≡</button>
+
+<aside class="sidebar" id="sidebar">
+  <div class="brand">
+    <div class="brand-mark">n</div>
+    <div>
+      <div class="brand-name">nanochat</div>
+      <div class="brand-sub">interactive internals</div>
+    </div>
+  </div>
+
+  <div class="nav-group-label">基础</div>
+  <nav id="navLinks">
+    <a class="nav-link" href="#overview"><span class="nav-num">00</span>全景：一句话如何变成 token</a>
+    <a class="nav-link" href="#tokenizer"><span class="nav-num">01</span>Tokenizer：文本 → token id</a>
+    <a class="nav-link" href="#embedding"><span class="nav-num">02</span>Embedding：id → 向量</a>
+    <a class="nav-link" href="#attention"><span class="nav-num">03</span>Attention：Q / K / V 与 softmax</a>
+    <a class="nav-link" href="#multihead"><span class="nav-num">04</span>多头、GQA 与滑窗</a>
+    <a class="nav-link" href="#block"><span class="nav-num">05</span>一个 Transformer Block</a>
+  </nav>
+
+  <div class="nav-group-label">训练</div>
+  <nav>
+    <a class="nav-link" href="#pretrain"><span class="nav-num">06</span>Pre-training：数据到梯度</a>
+    <a class="nav-link" href="#sft"><span class="nav-num">07</span>SFT：对话模板与 loss mask</a>
+    <a class="nav-link" href="#rl"><span class="nav-num">08</span>RL：rollout 与 advantage</a>
+  </nav>
+
+  <div class="nav-group-label">推理与代码</div>
+  <nav>
+    <a class="nav-link" href="#inference"><span class="nav-num">09</span>Inference：prefill、decode、KV cache</a>
+    <a class="nav-link" href="#code-map"><span class="nav-num">10</span>代码地图与运行方式</a>
+  </nav>
+
+  <div class="sidebar-foot">
+    <div>基于当前 checkout 的代码</div>
+    <div><code>92d63d4</code> · 2026-07-03</div>
+    <div style="margin-top:8px">所有可交互数值都是教学示意；真实维度与代码片段以仓库为准。</div>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="hero">
+    <div class="eyebrow"><span class="dot"></span> nanochat internals · 2026</div>
+    <h1>把一句话，拆成<br><span class="accent">attention、梯度与 KV cache</span></h1>
+    <p class="lede">
+      这不是一篇“Transformer 综述”。我们沿着 <b>nanochat</b> 的真实代码，从
+      <code>render_conversation</code> 到 <code>CausalSelfAttention.forward</code>，再到
+      <code>Engine.generate</code>，把一次 token 的产生过程拆开给你看。
+    </p>
+    <div class="hero-meta">
+      <span class="pill"><b>d24</b> · 24 layers · 1536 dim · 12 heads</span>
+      <span class="pill"><b>32K</b> BPE vocab</span>
+      <span class="pill"><b>2048</b> context</span>
+      <span class="pill"><b>~1.5h</b> 8×H100 · best 1.65h</span>
+    </div>
+    <div class="hero-grid">
+      <div class="hero-stat"><div class="k">core package</div><div class="v">~3.4k</div><div class="s">行 Python，刻意保持可读</div></div>
+      <div class="hero-stat"><div class="k">base model</div><div class="v">1.38B</div><div class="s">d24，含 value embeddings</div></div>
+      <div class="hero-stat"><div class="k">pretrain tokens</div><div class="v">5.84B</div><div class="s">speedrun 的 d24 / ratio 8</div></div>
+      <div class="hero-stat"><div class="k">metric</div><div class="v">CORE</div><div class="s">GPT-2 = 0.256525</div></div>
+    </div>
+  </header>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="overview">
+    <div class="chapter-kicker"><span class="num">00</span> the big picture</div>
+    <h2>全景：一句话如何变成下一个 token</h2>
+    <p class="lede">
+      nanochat 的推理路径可以压缩成一条流水线。先建立这个心智模型，后面的每个章节都只是把其中一格放大。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> pipeline · 点击任一阶段跳转<span class="spacer"></span>data flow</div>
+      <div class="lab-body">
+        <div class="pipeline" id="heroPipeline">
+          <div class="pipe-node" data-goto="#tokenizer"><div class="t">text</div><div class="s">"Why is the sky blue?"</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-goto="#tokenizer"><div class="t">tokenizer</div><div class="s">ids [BOS, ...]</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-goto="#embedding"><div class="t">embedding</div><div class="s">[T, d_model]</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-goto="#attention"><div class="t">24 × block</div><div class="s">attention + MLP</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-goto="#block"><div class="t">logits</div><div class="s">[T, 32768]</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-goto="#inference"><div class="t">sample</div><div class="s">next token</div></div>
+        </div>
+      </div>
+      <div class="lab-foot">真实推理还会在每层缓存 K/V（KV cache），这样 decode 时不必重算整段 prompt。</div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4>这个仓库最特别的地方</h4>
+        <p><b>一个主旋钮</b>：<code>--depth</code> 决定模型大小，宽度、头数、token 预算、学习率等由 d12 参考模型和 scaling law 自动推出；仍然可以手动覆盖 batch、window、FP8 等参数。</p>
+        <p><b>一份完整配方</b>：tokenizer、ClimbMix 数据、预训练、SFT、RL、CORE、KV-cache 推理都在一个仓库里，没有巨型框架抽象。</p>
+      </div>
+      <div class="card">
+        <h4>先记住三个形状</h4>
+        <p><code>x: [B, T, d_model]</code><br>
+        <code>q/k/v: [B, T, n_head, head_dim]</code><br>
+        <code>logits: [B, T, vocab_size]</code></p>
+        <p>B 是 batch，T 是序列长度。nanochat 训练时 T=2048；d24 的 d_model=1536，head_dim=128。</p>
+      </div>
+    </div>
+
+    <div class="callout teal">
+      <span class="tag">阅读方式</span>
+      每一章都有一个可交互的 lab。你可以先玩 lab，再点“查看源码”对照真实实现。所有代码片段都直接来自当前仓库，并标注了行号。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="tokenizer">
+    <div class="chapter-kicker"><span class="num">01</span> text → ids</div>
+    <h2>Tokenizer：模型看到的不是字，是整数</h2>
+    <p class="lede">
+      nanochat 用 GPT-4 风格的 byte-level BPE：训练时用 <code>rustbpe</code>，推理时用
+      <code>tiktoken</code>。默认词表 32768：32759 个基础 token（256 个字节 token + 32503 个 merge），最后 9 个是特殊 token。
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4>为什么是 byte-level？</h4>
+        <p>任何 UTF-8 文本都能拆成字节，所以不会出现“未登录词”。BPE 只是反复把最常见的相邻 pair 合并成一个新 token。</p>
+        <p>nanochat 的切分正则把数字限制成 <code>\p{N}{1,2}</code>，而不是 GPT-4 的 1–3 位；这是为了在 32K 词表里不浪费太多 token 给数字。</p>
+      </div>
+      <div class="card">
+        <h4>9 个特殊 token</h4>
+        <p><code>&lt;|bos|&gt;</code> 是文档/序列开头；其余 8 个用于聊天和 Python 工具：<code>user_start/end</code>、<code>assistant_start/end</code>、<code>python_start/end</code>、<code>output_start/end</code>。</p>
+        <p>预训练时每个文档前都加 BOS；SFT 时这些特殊 token 把一段段对话包起来。</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 01 · text → token chips<span class="spacer"></span>demo tokenizer</div>
+      <div class="lab-body">
+        <div class="controls">
+          <input id="tokenInput" type="text" value="Why is the sky blue?" aria-label="输入要分词的文本" style="flex:1;min-width:220px">
+          <button class="btn primary" id="tokenizeBtn">Tokenize</button>
+          <button class="btn ghost" data-snippet="specials">查看特殊 token</button>
+        </div>
+        <div class="sample-row">
+          <button class="sample-text">Why is the sky blue?</button>
+          <button class="sample-text">Natalia sold 48 clips.</button>
+          <button class="sample-text">&lt;|user_start|&gt;hello&lt;|user_end|&gt;</button>
+        </div>
+        <div style="margin-top:14px">
+          <div class="matrix-label">token ids（含 BOS）</div>
+          <div class="token-strip" id="tokenOutput"></div>
+          <div class="sft-mask-note" id="tokenSummary"></div>
+        </div>
+        <div class="callout" style="margin-bottom:0">
+          <span class="tag">注意</span>
+          这是教学用的简化分词器，不是仓库里真正的 32K BPE 权重；它只用来展示“文本 → 整数 → 特殊 token”的形状。真实 tokenizer 的 BPE 合并表在 <code>tokenizer.pkl</code> 里。
+        </div>
+      </div>
+      <div class="lab-foot">真实聊天模板的 mask 规则在 <code>render_conversation()</code>：user/tool output 不训练，assistant 文本和工具调用训练。</div>
+    </div>
+
+    <h3>从文本到聊天模板</h3>
+    <p>
+      预训练阶段，文档只是 <code>&lt;|bos|&gt; + text</code>。SFT 阶段，一条 conversation 会被渲染成：
+    </p>
+    <div class="formula">
+      <span class="hl">&lt;|bos|&gt;</span>
+      &lt;|user_start|&gt; user text &lt;|user_end|&gt;
+      &lt;|assistant_start|&gt; assistant text
+      [&lt;|python_start|&gt; expr &lt;|python_end|&gt;
+      &lt;|output_start|&gt; result &lt;|output_end|&gt;]
+      &lt;|assistant_end|&gt;
+    </div>
+    <p>
+      <code>render_conversation()</code> 同时返回 <code>ids</code> 和 <code>mask</code>：mask=1 的位置才参与 SFT loss。
+      这就是“模型只学 assistant 该说什么，不学用户说了什么”的实现方式。
+    </p>
+    <button class="code-link" data-snippet="chat-template">查看 tokenizer.py · render_conversation</button>
+
+    <div class="callout violet">
+      <span class="tag">细节</span>
+      如果第一条是 system message，代码会把它合并进第一条 user message；并且强制 user/assistant 交替。这样做是为了让模板足够简单，不需要处理任意 role 组合。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="embedding">
+    <div class="chapter-kicker"><span class="num">02</span> ids → vectors</div>
+    <h2>Embedding：把整数变成可计算的向量</h2>
+    <p class="lede">
+      token id 本身没有语义。模型用一张可学习的 embedding table <code>wte</code> 把每个 id 映射成
+      <code>d_model</code> 维向量，然后做 RMSNorm，再进入 Transformer。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 02 · 一个 token 的向量长什么样<span class="spacer"></span>toy 8-dim</div>
+      <div class="lab-body">
+        <div class="controls">
+          <span class="control-label">token</span>
+          <div class="segmented" id="embedTokens"></div>
+          <span class="spacer"></span>
+          <label class="switch"><input type="checkbox" id="smearToggle" checked> 显示 smear</label>
+          <button class="btn ghost" data-snippet="forward">查看 forward</button>
+        </div>
+        <div class="grid-2">
+          <div>
+            <div class="matrix-label">① wte[id] · 原始向量</div>
+            <div class="vector-row"><span class="vl">x</span><div class="vector-grid" id="embedBefore"></div></div>
+            <div class="matrix-label" style="margin-top:12px">② RMSNorm(x)</div>
+            <div class="vector-row"><span class="vl">x</span><div class="vector-grid" id="embedAfter"></div></div>
+          </div>
+          <div>
+            <div class="matrix-label">③ smear：混入前一个 token</div>
+            <div class="vector-row"><span class="vl">x<sub>i</sub></span><div class="vector-grid" id="embedSmear"></div></div>
+            <p class="sft-mask-note" id="embedNote"></p>
+            <div class="formula-mini">
+              gate = λ · sigmoid(W<sub>smear</sub> · x<sub>i</sub>[:24])<br>
+              x<sub>i</sub> ← x<sub>i</sub> + gate ⊙ x<sub>i-1</sub>
+            </div>
+          </div>
+        </div>
+        <div class="callout" style="margin-bottom:0">
+          <span class="tag">真实维度</span>
+          d24 的 <code>wte</code> 是 <code>32768 × 1536</code>；每个 token 的向量是 1536 维。lab 用 8 维只是为了能在一屏里看清。
+        </div>
+      </div>
+      <div class="lab-foot">RMSNorm 只按最后一维归一化，不改变形状；embedding 在 bf16 里存储，Linear 权重仍在 fp32。lab 用固定 gate=0.34；真实模型 gate 由 <code>smear_gate</code> 学习，<code>smear_lambda</code> 初始为 0。</div>
+    </div>
+
+    <h3>代码里还发生了什么</h3>
+    <div class="grid-3">
+      <div class="card tight"><h4>RMSNorm</h4><p><code>x / sqrt(mean(x²)+eps)</code>，没有可学习参数。nanochat 在 attention/MLP 前都先 norm。</p></div>
+      <div class="card tight"><h4>smear</h4><p>把前一个 token 的 embedding 用一个小 gate 混进当前 token，给模型一个便宜的 bigram 信号。只在训练/推理都保留。</p></div>
+      <div class="card tight"><h4>value embedding</h4><p>另有一张 <code>value_embeds</code> table，在部分层通过 gate 加到 V 上（<code>v + gate·ve</code>）；它不是 token embedding 的复制。</p></div>
+    </div>
+
+    <h3>位置信息：RoPE 在 Q/K 上旋转</h3>
+    <p>
+      nanochat 不用绝对位置 embedding。它在每一层把每个 head 的 <code>head_dim</code> 分成两半，对应维度配对，再按位置旋转：
+      位置越远，相对旋转越大。这样 attention score 天然带相对位置信息。
+    </p>
+    <div class="formula">
+      d = head_dim / 2<br>
+      θ<sub>i</sub> = pos · 100000<sup>−2i/head_dim</sup><br>
+      q'<sub>i</sub> = q<sub>i</sub>·cos(θ<sub>i</sub>) + q<sub>i+d</sub>·sin(θ<sub>i</sub>)<br>
+      q'<sub>i+d</sub> = −q<sub>i</sub>·sin(θ<sub>i</sub>) + q<sub>i+d</sub>·cos(θ<sub>i</sub>)
+    </div>
+    <p>
+      这正是 <code>apply_rotary_emb</code> 的布局：<code>x1 = x[..., :d]</code>、<code>x2 = x[..., d:]</code>，
+      然后 <code>y1 = x1·cos + x2·sin</code>、<code>y2 = −x1·sin + x2·cos</code>。
+      代码注释说它按 <code>−θ</code> 旋转，是转置约定；只有相对 q/k 旋转才有意义，所以与教科书写法功能等价。
+    </p>
+    <button class="code-link" data-snippet="rope">查看 gpt.py · apply_rotary_emb</button>
+    <p>
+      代码里 q 和 k 在 RoPE 之后先做 QK norm，再各乘 <code>1.2</code>，让 attention 更“尖”。
+      这两步都是 nanochat 为了小模型收敛做的细节，不属于标准 Transformer。
+    </p>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="attention">
+    <div class="chapter-kicker"><span class="num">03</span> the core</div>
+    <h2>Attention：每个 token 在问“我该看谁？”</h2>
+    <p class="lede">
+      Attention 的本质是一次可学习的加权平均：每个 query 对所有 key 打分，softmax 成权重，再对 value 加权求和。
+      nanochat 的版本还加了 RoPE、QK norm、causal mask、滑窗和 value embedding。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 03 · attention 逐帧拆解<span class="spacer"></span>6 tokens · 2 heads · d_head=4</div>
+      <div class="lab-body">
+        <div class="controls">
+          <span class="control-label">head</span>
+          <div class="segmented" id="attnHead">
+            <button data-head="0" class="active">H1</button>
+            <button data-head="1">H2</button>
+          </div>
+          <span class="control-label">query</span>
+          <div class="segmented" id="attnQuery"></div>
+          <span class="spacer"></span>
+          <label class="switch"><input type="checkbox" id="attnCausal" checked> causal</label>
+          <label class="switch"><input type="checkbox" id="attnWindow"> 滑窗</label>
+          <label class="switch"><input type="checkbox" id="attnQKNorm" checked> QK norm</label>
+          <button class="btn small ghost" id="attnPlay">▶ 播放</button>
+          <button class="btn small ghost" id="attnReset">重算</button>
+        </div>
+
+        <div class="attn-step" id="attnSteps">
+          <button data-step="0" class="active">1 token</button>
+          <button data-step="1">2 embed</button>
+          <button data-step="2">3 Q/K/V</button>
+          <button data-step="3">4 scores</button>
+          <button data-step="4">5 mask</button>
+          <button data-step="5">6 softmax</button>
+          <button data-step="6">7 output</button>
+        </div>
+
+        <div class="attn-layout">
+          <div class="attn-left">
+            <div class="attn-panel">
+              <h5>token 序列</h5>
+              <div class="token-strip" id="attnTokens"></div>
+              <div class="sft-mask-note" id="attnStageLabel">先看整段输入；每一步只会多揭示一张表。</div>
+            </div>
+
+            <div class="attn-panel" id="qkvPanel">
+              <h5>Q / K / V · 当前 head</h5>
+              <div class="grid-3">
+                <div><div class="matrix-label">Q [T, d_head]</div><div class="matrix-wrap"><div class="matrix" id="qMatrix"></div></div></div>
+                <div><div class="matrix-label">K [T, d_head]</div><div class="matrix-wrap"><div class="matrix" id="kMatrix"></div></div></div>
+                <div><div class="matrix-label">V [T, d_head]</div><div class="matrix-wrap"><div class="matrix" id="vMatrix"></div></div></div>
+              </div>
+            </div>
+
+            <div class="attn-panel" id="scorePanel">
+              <h5>attention scores → softmax</h5>
+              <div class="grid-2">
+                <div>
+                  <div class="matrix-label">QK<sup>T</sup> / √d_head · 行=query，列=key</div>
+                  <div class="matrix-wrap"><div class="matrix" id="scoreMatrix"></div></div>
+                </div>
+                <div>
+                  <div class="matrix-label" id="softmaxLabel">softmax · 选中 query 的权重</div>
+                  <div class="softmax-bars" id="softmaxBars"></div>
+                  <div class="formula-mini" id="attnWindowNote"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="attn-panel" id="outputPanel">
+              <h5>加权求和 + 输出投影 → 当前 query 的 8 维输出</h5>
+              <div class="vector-row"><span class="vl">y</span><div class="vector-grid" id="attnOutput"></div></div>
+              <div class="sft-mask-note" id="attnOutputNote"></div>
+            </div>
+          </div>
+
+          <div class="attn-right">
+            <div class="attn-panel">
+              <h5>这一步在做什么</h5>
+              <div id="attnNarrative" class="kv-note"></div>
+            </div>
+            <div class="attn-panel">
+              <h5>公式</h5>
+              <div class="formula-mini">
+                Q = x W<sub>q</sub>, K = x W<sub>k</sub>, V = x W<sub>v</sub><br>
+                s<sub>ij</sub> = (q<sub>i</sub> · k<sub>j</sub>) / √d<br>
+                a<sub>ij</sub> = softmax<sub>j</sub>(s<sub>ij</sub> + mask)<br>
+                y<sub>i</sub> = Σ<sub>j</sub> a<sub>ij</sub> v<sub>j</sub>
+              </div>
+              <div class="legend">
+                <span><i style="background:rgba(94,234,212,.7)"></i> 允许的 key</span>
+                <span><i style="background:rgba(148,163,184,.15)"></i> 被 mask</span>
+                <span><i style="background:var(--orange)"></i> 当前 query</span>
+              </div>
+            </div>
+            <div class="attn-panel">
+              <h5>真实代码的形状</h5>
+              <div class="formula-mini" id="attnShapes"></div>
+              <button class="code-link" data-snippet="attention">查看 attention.forward</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="lab-foot">数值由示意权重算出，重点是流程、mask 和形状；真实模型里的权重是训练出来的。点击矩阵行可以切换 query。</div>
+    </div>
+
+    <h3>把公式翻译成代码</h3>
+    <p>
+      代码里没有显式写出 <code>softmax(QK<sup>T</sup>/√d)</code> 这一行，因为 Flash Attention / SDPA 把
+      softmax 和加权求和融合在核函数里了。但数学完全一样：
+    </p>
+    <div class="grid-3">
+      <div class="card tight"><h4>① 投影</h4><p><code>q = c_q(x)</code>，<code>k = c_k(x)</code>，<code>v = c_v(x)</code>。形状从 <code>[B,T,C]</code> 变 <code>[B,T,H,D]</code>。</p></div>
+      <div class="card tight"><h4>② 打分</h4><p><code>s = q·k / √D</code>。nanochat 还会加 RoPE、做 QK norm、再把 q/k 各乘 1.2。</p></div>
+      <div class="card tight"><h4>③ 加权</h4><p><code>a = softmax(s + mask)</code>，<code>y = a·v</code>。mask 负责 causal 和滑窗。</p></div>
+    </div>
+
+    <div class="callout red">
+      <span class="tag">常见误解</span>
+      “attention 的 softmax 有 temperature”在 nanochat 里没有。这里的 softmax 就是普通 softmax；
+      生成时的 temperature/top-k 是在 <b>最终 logits</b> 上做的，不在 attention 里。
+    </div>
+
+    <h3>softmax 到底在做什么</h3>
+    <p>
+      对第 i 个 query，所有允许的 key 分数先减最大值（数值稳定），再取 exp，最后除以总和。
+      结果是一组非负、和为 1 的权重。softmax 的“温度”由分数的尺度决定：分数越大，分布越尖。
+    </p>
+    <div class="formula">
+      a<sub>ij</sub> = exp(s<sub>ij</sub> − max<sub>j</sub> s<sub>ij</sub>) / Σ<sub>j'</sub> exp(s<sub>ij'</sub> − max<sub>j</sub> s<sub>ij</sub>)
+    </div>
+    <p>
+      nanochat 的 <code>1/√d_head</code> 缩放就是为了让点积的方差大致稳定在 1，避免 softmax 过早饱和。注意 q/k 还各自乘了 1.2，所以实际 logits 尺度是 <code>1.44/√d_head</code>。
+    </p>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="multihead">
+    <div class="chapter-kicker"><span class="num">04</span> heads & windows</div>
+    <h2>多头、GQA 与滑窗：让 attention 更便宜</h2>
+    <p class="lede">
+      一个 head 只能学一种“看谁”的模式。多头让模型并行学多种关系；滑窗则直接限制每个 token 能看多远，
+      用更少的计算换更长的上下文。
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4>Multi-head</h4>
+        <p><code>n_head</code> 个 head，每个有自己的 Q/K/V 投影，<code>head_dim = d_model / n_head</code>。每个 head 独立做 attention，最后 concat 再过 <code>c_proj</code>。</p>
+        <p>d24：<code>d_model=1536</code>，<code>n_head=12</code>，<code>head_dim=128</code>。</p>
+      </div>
+      <div class="card">
+        <h4>GQA</h4>
+        <p>GQA 让多个 Q head 共享一组 K/V head（<code>n_kv_head &lt; n_head</code>），减少 KV cache 和 K/V 投影。例如 12 个 Q head、4 个 KV head 时，每 3 个 Q head 共享一组 K/V。</p>
+        <p>代码支持 GQA，但 <code>base_train</code> 默认 <code>n_kv_head = n_head</code>，也就是 MHA。要改小 <code>n_kv_head</code> 需要改 <code>GPTConfig</code>/<code>build_model_meta</code> 并重新训练；它不是 <code>base_train</code> 的 CLI 旋钮。</p>
+      </div>
+    </div>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 04 · 每层的窗口不一样<span class="spacer"></span>window_pattern = "SSSL"</div>
+      <div class="lab-body">
+        <div class="controls">
+          <span class="control-label">layer</span>
+          <input type="range" id="layerSlider" min="0" max="7" value="0" step="1">
+          <span class="pill" id="layerReadout">layer 0 · S · window 512</span>
+          <span class="spacer"></span>
+          <button class="btn ghost small" data-snippet="window">查看 _compute_window_sizes</button>
+        </div>
+        <div class="matrix-label">每一层能看到哪些 key（示意：8 层 × 16 key，当前 query 在最后；真实是 2048）</div>
+        <div class="layer-list" id="layerGrid"></div>
+        <div class="sft-mask-note" id="layerNote"></div>
+        <div class="formula-mini">
+          window_size = (left, 0) · left=512 表示当前 token + 512 个历史 key<br>
+          -1 是通用 API 的“无限”写法；模型里 L 层用 (2048, 0)<br>
+          S = ceil(sequence_len / 4 / 128) × 128 · 2048 → 512<br>
+          pattern 逐层平铺，<b>最后一层强制 L</b>
+        </div>
+      </div>
+      <div class="lab-foot">滑窗减少 attention 的 FLOPs 和 KV cache 读取，但信息只能沿层间逐步“传远”；最后一层 full context 负责汇总。</div>
+    </div>
+
+    <h3>为什么最后一段是 2048？</h3>
+    <p>
+      默认 <code>sequence_len=2048</code>，S 窗口是 512。也就是说大部分层每个 token 只看最近 512 个历史 token（加当前约 513 个 key），
+      每 4 层中有 1 层可以看完整 2048。这个模式在代码里是字符串 <code>"SSSL"</code>，逐层平铺。
+    </p>
+    <div class="callout">
+      <span class="tag">代码细节</span>
+      <code>gpt.py</code> 的注释里写 “2048 → 768” 是旧注释；实际公式
+      <code>-(-2048 // 4 // 128) * 128 = 512</code>。教程以运行结果为准。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="block">
+    <div class="chapter-kicker"><span class="num">05</span> the block</div>
+    <h2>一个 Transformer Block：残差、MLP 与 logits</h2>
+    <p class="lede">
+      Attention 只是 block 的一半。另一半是 MLP；两者都包在 pre-norm 残差里。nanochat 还加了几枚“小旋钮”，
+      让 24 层的小模型更容易训。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 05 · 数据怎么流过一层<span class="spacer"></span>hover / click</div>
+      <div class="lab-body">
+        <div class="block-diagram">
+          <div class="block-stack">
+            <div class="block-item" data-block="norm">RMSNorm</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="attn">CausalSelfAttention</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="resid1">+ residual</div>
+          </div>
+          <div class="block-center">
+            <div class="block-stack">
+              <div class="block-item" data-block="x0">x = resid_λ · x + x0_λ · x<sub>0</sub></div>
+              <div class="block-arrow">↓</div>
+              <div class="block-item" data-block="ve">value embedding → V</div>
+              <div class="block-arrow">↓</div>
+              <div class="block-item" data-block="attn2">attention（causal + window）</div>
+              <div class="block-arrow">↓</div>
+              <div class="block-item" data-block="norm2">RMSNorm</div>
+              <div class="block-arrow">↓</div>
+              <div class="block-item" data-block="mlp">MLP: Linear → ReLU² → Linear</div>
+              <div class="block-arrow">↓</div>
+              <div class="block-item" data-block="resid2">+ residual</div>
+            </div>
+          </div>
+          <div class="block-stack">
+            <div class="block-item" data-block="backout">mid-layer backout</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="finalnorm">final RMSNorm</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="lmhead">lm_head → logits</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="softcap">softcap = 15 · tanh</div>
+            <div class="block-arrow">↓</div>
+            <div class="block-item" data-block="loss">cross_entropy(next token)</div>
+          </div>
+        </div>
+        <div class="attn-panel" style="margin-top:12px;margin-bottom:0">
+          <h5>当前选中</h5>
+          <div id="blockInfo" class="kv-note"></div>
+        </div>
+      </div>
+      <div class="lab-foot">左/中/右不是三条并行路径：左边是 block 的简化视图，中间展开 block 内部，右边是最终输出头。pre-norm 让残差主干保持恒等路径；zero-init 的输出投影让每个 block 初始接近“什么都不做”。</div>
+    </div>
+
+    <div class="grid-2">
+      <div>
+        <h3>MLP 为什么是 ReLU²？</h3>
+        <p>
+          标准 Transformer 用 GELU/SwiGLU。nanochat 用 <code>ReLU(x)²</code>：两次矩阵乘、4× 扩张，
+          没有额外门控参数，kernel 也简单。对小模型和固定预算来说，这是“便宜且够好”的选择。
+        </p>
+        <div class="formula">
+          h = ReLU(x W<sub>fc</sub>)²<br>
+          y = h W<sub>proj</sub>
+        </div>
+      </div>
+      <div>
+        <h3>那些“小旋钮”</h3>
+        <ul>
+          <li><b>resid_lambdas</b>：每层残差缩放，初始 1.15 → 1.05，深层更小。</li>
+          <li><b>x0_lambdas</b>：把初始 embedding 混回每层，初始 0.2 → 0.05，帮助浅层信息直达。</li>
+          <li><b>smear</b>：把前一个 token 的 embedding 混入当前 token。</li>
+          <li><b>backout</b>：在最终 logits 前减掉中间层残差，去掉低层特征。</li>
+          <li><b>logit softcap</b>：<code>15·tanh(logits/15)</code>，防止 logits 爆掉。</li>
+        </ul>
+      </div>
+    </div>
+
+    <button class="code-link" data-snippet="config">查看 GPTConfig</button>
+    <button class="code-link" data-snippet="block">查看 Block.forward</button>
+    <button class="code-link" data-snippet="forward">查看 GPT.forward</button>
+    <button class="code-link" data-snippet="mlp">查看 MLP</button>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="pretrain">
+    <div class="chapter-kicker"><span class="num">06</span> pre-training</div>
+    <h2>Pre-training：把海量文本变成下一次 token 的概率</h2>
+    <p class="lede">
+      预训练的目标只有一个：给定前面的 token，预测下一个 token。所有 attention、MLP、优化器细节，
+      都是为这个目标服务。nanochat 的特别之处是数据 packing、Muon 和自动超参。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 06 · 一个训练 step 的流水线<span class="spacer"></span>play</div>
+      <div class="lab-body">
+        <div class="pipeline" id="trainPipeline">
+          <div class="pipe-node" data-train-step="0"><div class="t">batch</div><div class="s">x/y [B,T]</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-train-step="1"><div class="t">forward</div><div class="s">logits [B,T,V]</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-train-step="2"><div class="t">CE loss</div><div class="s">scalar</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-train-step="3"><div class="t">backward</div><div class="s">grads</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-train-step="4"><div class="t">Muon / AdamW</div><div class="s">update</div></div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-node" data-train-step="5"><div class="t">next step</div><div class="s">repeat</div></div>
+        </div>
+        <div class="grid-2" style="margin-top:10px">
+          <div>
+            <div class="controls">
+              <button class="btn primary" id="trainPlay">▶ 播放</button>
+              <button class="btn ghost" id="trainReset">重置</button>
+              <span class="pill" id="trainStepLabel">step 0</span>
+            </div>
+            <div class="kv-note" id="trainNarrative"></div>
+            <div class="train-readout">
+              <div class="readout"><div class="k">loss</div><div class="v warn" id="trainLossReadout">—</div></div>
+              <div class="readout"><div class="k">tok / step · d24 speedrun</div><div class="v" id="trainTok">1,048,576</div></div>
+              <div class="readout"><div class="k">optimizer</div><div class="v good">Muon + AdamW</div></div>
+            </div>
+          </div>
+          <div class="train-canvas-wrap">
+            <canvas id="lossCanvas" width="520" height="150"></canvas>
+            <div class="sft-mask-note">示意曲线，不是某次真实 run 的日志；真实指标看 val_bpb / CORE。</div>
+          </div>
+        </div>
+      </div>
+      <div class="lab-foot">base_train 一个 step 会做 grad accumulation：多个 micro-batch 累积梯度，再统一 optimizer.step()。</div>
+    </div>
+
+    <h3>数据：先 best-fit packing，再喂给模型</h3>
+    <p>
+      ClimbMix 的每个 parquet 分片约 250M 字符，最后一片固定为验证集。文本不预先 tokenize 成 <code>.bin</code>，
+      而是 DataLoader 里边读边 tokenize。每行容量是 <code>T+1=2049</code>：输入取前 2048、目标右移一位；lab 用 24 个格子示意。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 06b · best-fit BOS packing<span class="spacer"></span>row capacity = 24 cells (toy)</div>
+      <div class="lab-body">
+        <div class="controls">
+          <button class="btn primary" id="packNext">重新打包</button>
+          <button class="btn ghost" id="packReset">清空</button>
+          <span class="pill" id="packStats">utilization 0%</span>
+          <span class="spacer"></span>
+          <button class="btn ghost small" data-snippet="packing">查看 packing 代码</button>
+        </div>
+        <div class="pack-row" id="packRow"></div>
+        <div class="pack-docs" id="packDocs"></div>
+        <div class="sft-mask-note">每个文档前都有 BOS；没有 document-level attention mask，causal mask 仍可跨文档。真实 row 容量 2049（2048 输入 + 1 个位移目标），约 35% token 会被裁掉。</div>
+      </div>
+      <div class="lab-foot">这一步决定了 GPU 每秒能“吃到”多少有效 token；packing 做得好，同样的 FLOPs 能见到更多完整文档。</div>
+    </div>
+
+    <h3>预训练里的 attention 具体在算什么</h3>
+    <p>
+      对一个 packed batch，模型把每行当作一条长度为 2048 的序列。Attention 的 causal mask 让位置 t 只能看
+      ≤t 的 key；滑窗再砍掉太远的 key。每个位置都计算“下一个 token”的交叉熵，所有有效位置都参与 loss。
+    </p>
+    <div class="grid-2">
+      <div class="card">
+        <h4>前向</h4>
+        <p><code>x [B,2048] → wte → 24 blocks → lm_head → logits [B,2048,32768]</code></p>
+        <p>每个位置输出 32768 个 logits，softmax 后取出目标 token 的概率，取负对数。</p>
+      </div>
+      <div class="card">
+        <h4>反向</h4>
+        <p>交叉熵对 logits 的梯度是 <code>softmax − onehot</code>；再沿 Transformer 反传。Muon 更新 2D 矩阵，AdamW 更新 embedding/lm_head/标量。</p>
+      </div>
+    </div>
+    <div class="formula">
+      x [B, 2048, 1536]<br>
+      → 24 × { RMSNorm → Q/K/V [B, 2048, 12, 128]<br>
+      &nbsp;&nbsp;→ RoPE + QK norm（再 ×1.2）+ causal/window attention<br>
+      &nbsp;&nbsp;→ concat → c_proj → + residual<br>
+      &nbsp;&nbsp;→ RMSNorm → MLP(4×) → + residual }<br>
+      → final RMSNorm → lm_head → logits [B, 2048, 32768]<br>
+      → cross_entropy(logits, next_token)
+    </div>
+    <div class="formula">
+      loss = −(1 / N) · Σ<sub>t</sub> log softmax(logits<sub>t</sub>)[ y<sub>t</sub> ]
+    </div>
+    <p>
+      注意：在 Flash Attention / SDPA 里，<code>[B, H, 2048, 2048]</code> 的 attention 矩阵通常不会被显式写出来；
+      softmax 和加权求和融合在 kernel 内完成。上面的形状是数学上的概念形状。
+    </p>
+
+    <div class="callout">
+      <span class="tag">关键细节</span>
+      nanochat 的 base pretraining <b>没有 padding</b>：best-fit 保证每行 100% 填满，所以不需要 <code>ignore_index</code>。
+      SFT 才会用 padding + <code>-1</code> mask。
+    </div>
+
+    <h3>自动超参：depth 是主旋钮</h3>
+    <p>
+      给定 depth，代码计算 <code>model_dim = depth×64</code>（对齐到 128），然后用 d12 参考模型推导 token 预算、
+      batch size、LR 和 weight decay。这样 d12→d24 的配方可以整体缩放，不需要手调每个尺寸。
+    </p>
+    <div class="formula">
+      tokens ≈ target_param_data_ratio × (transformer matrices + lm_head)<br>
+      B ≈ B<sub>ref</sub> × (D / D<sub>ref</sub>)<sup>0.383</sup><br>
+      LR ∝ √(B / B<sub>ref</sub>) · weight decay ∝ √(B/B<sub>ref</sub>) · D<sub>ref</sub>/D
+    </div>
+    <button class="code-link" data-snippet="scaling">查看 base_train.py · scaling</button>
+    <button class="code-link" data-snippet="attention">查看 attention.forward</button>
+    <button class="code-link" data-snippet="forward">查看 GPT.forward</button>
+    <button class="code-link" data-snippet="train-step">查看一个 train step</button>
+    <button class="code-link" data-snippet="bpb">查看 bits-per-byte</button>
+
+    <h3>优化器与精度：为什么不是“一个 AdamW 走天下”</h3>
+    <div class="grid-3">
+      <div class="card tight">
+        <h4>Muon</h4>
+        <p>2D 矩阵（attention/MLP 的 Linear）用 Muon：Nesterov momentum → Polar Express 正交化 → NorMuon 方差归一 → cautious weight decay。它把更新矩阵推向“近似正交”，小模型上通常比 AdamW 更省步数。</p>
+      </div>
+      <div class="card tight">
+        <h4>AdamW</h4>
+        <p>Muon 只更新 <code>transformer.h</code> 里的 2D 矩阵；<code>wte</code>、<code>value_embeds</code>、<code>lm_head</code> 虽然也是 2D，但属于查表/输出头，和 per-layer 标量一起放进 fused AdamW。</p>
+      </div>
+      <div class="card tight">
+        <h4>显式精度</h4>
+        <p>不用 autocast：全局 <code>COMPUTE_DTYPE</code> 选 bf16/fp16/fp32，master weight 保持 fp32；H100 级 GPU 可开 <code>--fp8</code>（e4m3 输入/权重，e5m2 梯度），评估时切回 <code>COMPUTE_DTYPE</code>（通常是 bf16）。</p>
+      </div>
+    </div>
+    <p>
+      分布式时 nanochat 不包 <code>DistributedDataParallel</code>，而是在 <code>MuonAdamW</code> 里做
+      ZeRO-2 风格的 reduce-scatter / all-gather，并把通信和计算重叠。这样 optimizer state 也按 rank 分片，
+      单卡时通信路径自动退化为空操作。
+    </p>
+    <button class="code-link" data-snippet="optim-groups">查看参数分组</button>
+    <button class="code-link" data-snippet="muon">查看 Muon step</button>
+    <button class="code-link" data-snippet="fp8">查看 FP8 Linear</button>
+
+    <h3>怎么判断“变强了”</h3>
+    <p>
+      预训练每 250 步左右评估一次 <b>bits-per-byte</b>，每 2000 步左右跑一次 CORE。BPB 的分母是目标 token 对应的原始字节数，
+      所以换 tokenizer / 词表大小时仍然可比；CORE 则是 DCLM 的 22 个 ICL 任务，按随机基线做 centered accuracy 后平均。
+    </p>
+    <div class="formula">
+      val_bpb = Σ nats / (ln 2 × Σ bytes)<br>
+      CORE = mean<sub>task</sub> ( accuracy − random_baseline ) / ( 1 − random_baseline )
+    </div>
+    <p>
+      <code>base_train</code> 默认每 250 步评估 BPB、每 2000 步跑一次 CORE；speedrun 沿用默认。
+      自己做快速实验时，常把 <code>--core-metric-every</code> 设成 <code>999999</code>，让 CORE 只在最后跑一次。
+    </p>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="sft">
+    <div class="chapter-kicker"><span class="num">07</span> supervised fine-tuning</div>
+    <h2>SFT：把“会补全”变成“会对话”</h2>
+    <p class="lede">
+      Base model 只会续写。SFT 用带特殊 token 的对话数据，教它什么时候该回答、什么时候该调用工具、
+      以及多选题该输出哪个字母。关键是 <b>loss mask</b>：只训练 assistant 的部分。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 07 · 一条对话如何变成 token + mask<span class="spacer"></span>token + mask</div>
+      <div class="lab-body">
+        <div class="controls">
+          <span class="control-label">sample</span>
+          <div class="segmented" id="sftMode">
+            <button data-mode="simple" class="active">simple chat</button>
+            <button data-mode="tool">tool call</button>
+          </div>
+          <span class="spacer"></span>
+          <label class="switch"><input type="checkbox" id="sftMaskToggle" checked> 显示 loss mask</label>
+        </div>
+        <div class="token-strip" id="sftTokens"></div>
+        <div class="mask-legend">
+          <span><i style="background:rgba(125,211,252,.5)"></i> user（不训练）</span>
+          <span><i style="background:rgba(134,239,172,.5)"></i> assistant（训练）</span>
+          <span><i style="background:rgba(192,132,252,.5)"></i> python call（训练）</span>
+          <span><i style="background:rgba(251,191,36,.5)"></i> tool output（不训练）</span>
+          <span><i style="background:var(--green)"></i> 下划线 = mask 1</span>
+        </div>
+        <div class="sft-mask-note" id="sftStats"></div>
+        <div class="callout" style="margin-bottom:0">
+          <span class="tag">为什么</span>
+          如果用户消息也参与 loss，模型会学会“复述用户”；如果工具输出参与 loss，模型会学会“编造计算结果”。所以两者都 mask 掉。
+        </div>
+      </div>
+      <div class="lab-foot">SFT 数据混合：SmolTalk + MMLU auxiliary_train×3 + GSM8K train×4；验证集是 SmolTalk test 24K + MMLU test 5.2K + GSM8K test 420，比例与训练混合不同。lab 只看单条对话；真实 SFT 会把多条对话 best-fit 进一行，放不下时用 BOS 右填充，target 从 content_len−1 起设 −1。</div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4>对话模板</h4>
+        <p><code>&lt;|bos|&gt;</code> 开头；user 包在 <code>user_start/end</code>；assistant 包在
+        <code>assistant_start/end</code>。assistant 内容可以是纯文本，也可以是 text/python/python_output 的 part 列表。</p>
+        <p>Python 调用和输出分别用 <code>python_start/end</code> 与 <code>output_start/end</code> 包住；工具输出 mask=0。</p>
+      </div>
+      <div class="card">
+        <h4>训练配置</h4>
+        <p>SFT 继承 base checkpoint 的 seq_len、batch、LR，再乘 <code>init_lr_frac=0.8</code>；Muon 的 weight decay 设为 0，AdamW 各组仍保留自己的 weight decay；warmdown 0.5，final LR 0。</p>
+        <p>可选的 optimizer warm-start：加载 base 的 momentum buffer，但把 LR 重置为 SFT 的值。</p>
+      </div>
+    </div>
+
+    <p>
+      注意：SFT 数据里的 <code>python_output</code> 是数据集（例如 GSM8K）自带的结果，训练时 mask 掉；
+      推理或 RL rollout 时，才是 <code>Engine</code> 用计算器算出结果并作为 forced token 注入。
+    </p>
+    <button class="code-link" data-snippet="chat-template">查看 render_conversation</button>
+    <button class="code-link" data-snippet="sft-mask">查看 SFT mask 代码</button>
+
+    <div class="callout violet">
+      <span class="tag">评测</span>
+      SFT 后跑 ChatCORE：ARC-Easy / ARC-Challenge / MMLU（categorical）和 GSM8K / HumanEval（generative）。
+      分类题只比较答案字母的 logit；生成题默认 greedy 生成后执行/匹配答案。ChatCORE 是 centered accuracy 的平均。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="rl">
+    <div class="chapter-kicker"><span class="num">08</span> reinforcement learning</div>
+    <h2>RL：让模型从“做对/做错”里学</h2>
+    <p class="lede">
+      nanochat 的 RL 只在 GSM8K 上跑，算法是“简化版 GRPO”，实际更接近 REINFORCE：
+      同一个问题采样多条回答，reward 减组内均值得到 advantage，然后用 policy gradient 更新。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 08 · 组内 rollout 与 advantage<span class="spacer"></span>16 samples / question</div>
+      <div class="lab-body">
+        <div class="controls">
+          <button class="btn primary" id="rlSample">重新采样</button>
+          <span class="pill" id="rlMean">mean reward = —</span>
+          <span class="spacer"></span>
+          <button class="btn ghost small" data-snippet="rl-advantage">查看 advantage</button>
+        </div>
+        <div class="rollout-grid" id="rlRollouts"></div>
+        <div class="matrix-label" style="margin-top:12px">advantage = reward − group mean</div>
+        <div class="adv-bars" id="rlAdvBars"></div>
+        <div class="sft-mask-note">绿色 = 答对；红色 = 答错。刚好全对或全错时，所有 advantage 都是 0，这一步没有学习信号。</div>
+      </div>
+      <div class="lab-foot">真实训练：16 个 samples/question，reward 是 GSM8K 数字精确匹配；没有 KL、没有 PPO clip、没有 value model。</div>
+    </div>
+
+    <h3>和 PPO/GRPO 的差别</h3>
+    <div class="grid-3">
+      <div class="card tight"><h4>没有 KL</h4><p>不加载 reference model，也没有 trust region。代码注释说得很直接：删掉 KL。</p></div>
+      <div class="card tight"><h4>没有 ratio/clip</h4><p>rollout 是 on-policy 的，所以不需要 PPO 的 importance ratio 和 clip。</p></div>
+      <div class="card tight"><h4>组内 baseline</h4><p>advantage = r − mean(r)，不除标准差；这是 DAPO 风格的简化。</p></div>
+    </div>
+    <div class="formula">
+      L = − (1 / #valid tokens) Σ<sub>t</sub> log π(y<sub>t</sub> | y<sub>&lt;t</sub>) · A<br>
+      A = r − mean(r<sub>1..K</sub>)
+    </div>
+    <button class="code-link" data-snippet="rl-loss">查看 policy-gradient loss</button>
+    <p>
+      训练中每 60 步在 GSM8K test 上跑一次 pass@k（k=1…8，400 道题）：同一道题采样多条，
+      只要有一条答对就算 pass。这个指标比单条 greedy 更能反映“模型会不会做”。
+    </p>
+
+    <div class="callout">
+      <span class="tag">流程位置</span>
+      RL 不在 <code>speedrun.sh</code> 主流程里；speedrun 是 base → SFT → chat eval。RL 是可选后训练，且只支持 GSM8K。
+      仓库里没有 DPO、PPO、reward model 或 rejection sampling 的完整实现；post-training 就是 SFT + 这一份简化 RL。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="inference">
+    <div class="chapter-kicker"><span class="num">09</span> inference</div>
+    <h2>Inference：prefill 一次，decode 一步一步</h2>
+    <p class="lede">
+      推理分两个阶段：prefill 把整段 prompt 并行算完，填满 KV cache；decode 每次只算一个新 token，
+      但每一步都要重新读权重和 KV cache。理解这个区别，才能理解所有推理优化。
+    </p>
+
+    <div class="lab">
+      <div class="lab-head"><span class="live"></span> lab 09 · KV cache 的 prefill / decode<span class="spacer"></span>1 layer · toy</div>
+      <div class="lab-body">
+        <div class="controls">
+          <button class="btn primary" id="inferPlay">▶ 播放</button>
+          <button class="btn ghost" id="inferReset">重置</button>
+          <span class="pill" id="inferStep">prefill</span>
+          <span class="spacer"></span>
+          <label class="switch"><input type="checkbox" id="inferWindow"> 滑窗只读最近 4 个</label>
+        </div>
+        <div class="kv-legend">
+          <span><i style="background:rgba(94,234,212,.5)"></i> 已写入 cache</span>
+          <span><i style="background:rgba(255,180,84,.7)"></i> 当前 decode 读取</span>
+          <span><i style="background:rgba(148,163,184,.12)"></i> 未使用/被窗口裁掉</span>
+        </div>
+        <div class="kv-wrap" style="margin-top:10px">
+          <div class="kv-grid" id="kvGrid"></div>
+        </div>
+        <div class="grid-2" style="margin-top:12px">
+          <div class="kv-note" id="inferNarrative"></div>
+          <div>
+            <div class="infer-bars">
+              <div class="infer-bar"><span>prefill</span><div class="track"><div class="fill teal" id="prefillBar"></div></div><span>compute-bound</span></div>
+              <div class="infer-bar"><span>decode</span><div class="track"><div class="fill orange" id="decodeBar"></div></div><span>bandwidth-bound</span></div>
+            </div>
+            <div class="formula-mini" id="inferReadout"></div>
+          </div>
+        </div>
+      </div>
+      <div class="lab-foot">真实 KVCache 形状是 <code>[n_layers, B, T_max, n_kv_head, head_dim]</code>；Engine 先做 batch=1 prefill，再把整份 cache 复制到 <code>num_samples</code> 行；位置由 <code>cache_seqlens</code> 推进。lab 只画一行。</div>
+    </div>
+
+    <h3>KV cache 到底省了什么</h3>
+    <p>
+      没有 cache 时，每生成一个 token 都要把整段前缀重新过一遍 attention；有 cache 时，K/V 只算一次，
+      decode 只算新 token 的 Q/K/V，然后让它的 Q 去读历史 K/V。
+    </p>
+    <div class="formula">
+      cache 存储 / token = n_layers × 2 × n_kv_head × head_dim × dtype_bytes<br>
+      decode 读取 / step ≈ weights_bytes + B × Σ<sub>layers</sub> kv_read_bytes(context, window)
+    </div>
+    <p>
+      d24、bf16、12 个 KV head、head_dim=128：每层每 token 的 K+V 是 <code>2×12×128×2 = 6KB</code>；
+      24 层就是约 <code>144KB/token</code>。上下文越长，decode 越受显存带宽限制。
+      按 SSSL 的 18 个 S 层 + 6 个 L 层算，2048 context 时每行每步读
+      <code>18×512 + 6×2048 = 21,504</code> 个 key（约 126MB），而全上下文是 49,152 个 key（约 288MB）。
+    </p>
+
+    <h3>采样与停止</h3>
+    <div class="grid-3">
+      <div class="card tight"><h4>temperature = 0</h4><p>直接用 argmax，确定性地取概率最高的 token；生成式评测和 chat CLI 的 greedy 路径会用它。</p></div>
+      <div class="card tight"><h4>temperature &gt; 0</h4><p>logits 除以 temperature，再按 top-k 截断，最后 multinomial 采样。CLI 默认 temperature=0.6、top-k=50。</p></div>
+      <div class="card tight"><h4>停止条件</h4><p>采样到 <code>&lt;|assistant_end|&gt;</code> 或 <code>&lt;|bos|&gt;</code> 就结束该行；超过 max_tokens 也会停，CLI 会补一个 assistant_end。</p></div>
+    </div>
+
+    <h3>FA3 与 SDPA：同一数学，不同 kernel</h3>
+    <div class="grid-2">
+      <div class="card">
+        <h4>Flash Attention 3</h4>
+        <p>把 attention 分块在 SRAM 里计算，避免把 <code>T×T</code> 的 score 矩阵写回 HBM；支持 causal、滑窗和 KV cache。nanochat 在 Hopper/Ampere/Ada + bf16 时自动加载。</p>
+      </div>
+      <div class="card">
+        <h4>SDPA fallback</h4>
+        <p>PyTorch 的 <code>scaled_dot_product_attention</code>，任意 CUDA/CPU/MPS 都能跑；滑窗和 KV cache 用显式 mask/切片实现。Blackwell 目前走这条路，所以训练会慢一些。</p>
+      </div>
+    </div>
+
+    <h3>怎么量化推理成本</h3>
+    <p>
+      <code>scripts/infer_bench.py</code> 会扫不同的 decode batch size，报告 TTFT（首 token 时间）、TPOT（每 token 时间）、
+      tok/s、MBU、MFU 和峰值显存。decode 的 MBU 近似为：
+    </p>
+    <div class="formula">
+      MBU (%) = 100 × (weights_bytes + B × kv_read_bytes_per_step) / TPOT / peak_bandwidth
+    </div>
+    <p>
+      prefill 的 MFU 看算力利用率，decode 的 MBU 看带宽利用率。前者通常更高，后者才是长上下文推理的主要瓶颈。
+    </p>
+
+    <div class="grid-3">
+      <div class="opt-card"><div class="ico">◆</div><div class="t">Flash Attention</div><div class="d">不物化 T×T attention 矩阵，分块在 SRAM 里做 softmax；nanochat 在 Hopper/Ampere/Ada 上加载 FA3，Blackwell 退回 SDPA。</div><div class="tagline">kernel fusion</div></div>
+      <div class="opt-card"><div class="ico">▣</div><div class="t">KV cache</div><div class="d">prefill 一次，decode 复用；每层只存 K/V，不存 Q。滑窗层只读最近 window 个 key。</div><div class="tagline">avoid recompute</div></div>
+      <div class="opt-card"><div class="ico">◇</div><div class="t">GQA</div><div class="d">多个 Q head 共享 K/V head，直接减少 KV cache 体积和读取量。代码支持，默认未启用。</div><div class="tagline">less bandwidth</div></div>
+      <div class="opt-card"><div class="ico">▤</div><div class="t">Sliding window</div><div class="d">SSSL 让大多数层只看 512 token；KV cache 仍分配全长，但读取和 attention FLOPs 大幅下降。</div><div class="tagline">local attention</div></div>
+      <div class="opt-card"><div class="ico">▦</div><div class="t">Batching</div><div class="d">decode 每步是 memory-bound，增大 batch 能把同一份权重读取摊到更多行上；直到 compute 成为瓶颈。</div><div class="tagline">amortize weights</div></div>
+      <div class="opt-card"><div class="ico">⌘</div><div class="t">FP8 / compile</div><div class="d">训练和推理都可受益于 FP8；<code>torch.compile</code> 融合小算子。仓库的 FP8 主要接在 base_train。</div><div class="tagline">lower precision</div></div>
+    </div>
+
+    <button class="code-link" data-snippet="kv-cache">查看 KVCache</button>
+    <button class="code-link" data-snippet="generate">查看 Engine.generate</button>
+    <button class="code-link" data-snippet="sdpa">查看 SDPA fallback</button>
+    <button class="code-link" data-snippet="fa3">查看 FA3 条件</button>
+    <button class="code-link" data-snippet="bench">查看 infer_bench</button>
+
+    <div class="callout violet">
+      <span class="tag">工具调用</span>
+      Chat 里的 <code>&lt;|python_start|&gt;</code> 只调用 Engine 内置的受限计算器（算术 / <code>.count()</code> 字符串操作，3 秒超时），
+      不是完整 Python REPL。真正的代码执行沙箱在 <code>execution.py</code>，只用于 HumanEval 评分；两者不要混淆。
+      <button class="code-link" data-snippet="sandbox" style="margin-top:8px">查看 execution.py 的 guard</button>
+    </div>
+
+    <div class="callout">
+      <span class="tag">边界</span>
+      这个 Engine 是“单 prompt、多 sample”的批采样循环，不是 vLLM。仓库没有 paged attention、continuous batching、
+      speculative decoding、prefix caching 或生产级多请求调度；这些是外接服务时要补的。
+    </div>
+
+    <div class="callout red">
+      <span class="tag">Blackwell 注意</span>
+      当前 FA3 的预编译 kernel 主要覆盖 Ampere/Hopper/Ada（sm80/sm86/sm89/sm90）；RTX Pro 6000（sm_120）目前退回 SDPA。训练时建议
+      <code>--window-pattern=L</code>，让 SDPA 走 <code>is_causal=True</code> 的快路径。
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <section class="chapter" id="code-map">
+    <div class="chapter-kicker"><span class="num">10</span> map & run</div>
+    <h2>代码地图：从哪读起</h2>
+    <p class="lede">
+      如果你想自己改，建议按“模型 → 训练 → 数据 → 推理”的顺序读。每个文件都刻意保持短小。
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h4>模型与训练</h4>
+        <p><a href="../nanochat/gpt.py">nanochat/gpt.py</a>：GPT、attention、MLP、RoPE、logits。<br>
+        <a href="../scripts/base_train.py">scripts/base_train.py</a>：预训练循环、自动超参、FP8。<br>
+        <a href="../nanochat/optim.py">nanochat/optim.py</a>：Muon + AdamW、分布式通信。<br>
+        <a href="../nanochat/fp8.py">nanochat/fp8.py</a>：自研 FP8 Linear。</p>
+      </div>
+      <div class="card">
+        <h4>数据与后训练</h4>
+        <p><a href="../nanochat/tokenizer.py">nanochat/tokenizer.py</a>：BPE、特殊 token、聊天模板。<br>
+        <a href="../nanochat/dataset.py">nanochat/dataset.py</a>：ClimbMix 分片下载。<br>
+        <a href="../nanochat/dataloader.py">nanochat/dataloader.py</a>：best-fit packing。<br>
+        <a href="../scripts/chat_sft.py">scripts/chat_sft.py</a>：SFT 与 mask。<br>
+        <a href="../scripts/chat_rl.py">scripts/chat_rl.py</a>：GSM8K RL。<br>
+        <a href="../tasks/common.py">tasks/common.py</a>：Task / TaskMixture / 评测集。</p>
+      </div>
+      <div class="card">
+        <h4>评估</h4>
+        <p><a href="../nanochat/loss_eval.py">nanochat/loss_eval.py</a>：bits-per-byte。<br>
+        <a href="../nanochat/core_eval.py">nanochat/core_eval.py</a>：DCLM CORE。<br>
+        <a href="../scripts/base_eval.py">scripts/base_eval.py</a>：CORE / BPB / samples。<br>
+        <a href="../scripts/chat_eval.py">scripts/chat_eval.py</a>：ChatCORE。</p>
+      </div>
+      <div class="card">
+        <h4>推理与配方</h4>
+        <p><a href="../nanochat/engine.py">nanochat/engine.py</a>：KV cache、采样、工具。<br>
+        <a href="../nanochat/flash_attention.py">nanochat/flash_attention.py</a>：FA3/SDPA。<br>
+        <a href="../scripts/infer_bench.py">scripts/infer_bench.py</a>：TTFT/TPOT/MBU。<br>
+        <a href="../runs/speedrun.sh">runs/speedrun.sh</a>：8×H100 参考配方。</p>
+      </div>
+    </div>
+
+    <h3>本地运行</h3>
+    <div class="formula">
+      <span class="op"># 安装 + 训练 tokenizer + 预训练 + SFT</span><br>
+      uv sync --extra gpu<br>
+      python -m nanochat.dataset -n 50<br>
+      python -m scripts.tok_train<br>
+      python -m scripts.base_train --depth=12 --window-pattern=L --device-batch-size=16 \<br>
+      &nbsp;&nbsp;--total-batch-size=524288 --target-param-data-ratio=12 --run=dummy<br>
+      python -m scripts.chat_sft --run=dummy<br>
+      python -m scripts.chat_cli -p "Why is the sky blue?"
+    </div>
+    <p>
+      单卡训练时不要用 <code>torchrun</code>；代码会自动梯度累积。更完整的单卡建议见
+      <a href="../README.md">README</a> 和 <a href="../runs/runcpu.sh">runs/runcpu.sh</a>。
+    </p>
+
+    <div class="callout teal">
+      <span class="tag">下一步</span>
+      想改模型：从 <code>gpt.py</code> 的 <code>CausalSelfAttention</code> 和 <code>MLP</code> 开始；
+      想改训练：从 <code>base_train.py</code> 的 <code>get_scaling_params</code> / optimizer 开始；
+      想改推理：从 <code>engine.py</code> 的 <code>KVCache</code> 开始。
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <b>nanochat interactive internals</b> · 基于当前 checkout 的代码与 README 构建。
+  代码片段由 <code>tutorial/build_snippets.py</code> 从仓库直接抽取；lab 数值为教学示意。
+</footer>
+
+<!-- ===================================================================== -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title" id="drawerTitle">源码</div>
+      <div class="drawer-meta" id="drawerMeta">—</div>
+    </div>
+    <div class="drawer-actions">
+      <button class="btn small ghost" id="drawerCopy">复制</button>
+      <button class="btn small ghost" id="drawerClose" aria-label="关闭">×</button>
+    </div>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-code" id="drawerCode"></div>
+  </div>
+  <div class="drawer-foot">
+    <span>代码来自仓库当前 commit；行号与文件路径已标注。</span>
+    <a id="drawerLink" href="#" target="_blank" rel="noreferrer">打开文件 ↗</a>
+  </div>
+</aside>
+
+<script src="snippets.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
